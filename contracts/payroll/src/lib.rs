@@ -21,6 +21,9 @@ use signed_operator_actions::{
     consumed_key, require_not_expired, SignedOperatorAction, SignedOperatorPayload,
 };
 
+pub mod execution_authorization;
+use execution_authorization::ExecutionInitiatorAuthorization;
+
 const MAX_BATCH: u32 = 50;
 const MAX_DRAFT_DESCRIPTION_BYTES: u32 = 256;
 
@@ -1219,6 +1222,68 @@ impl Payroll {
     /// allowlist, company state) are rejected (issue #253).
     pub fn has_active_payroll_run(e: Env) -> bool {
         Self::pending_payroll_run_count(&e) > 0
+    }
+
+    // ── Issue #620: contract execution initiator authorization ─────────────
+
+    /// Require that the caller may initiate a contract execution (issue #620).
+    ///
+    /// Every on-chain execution entrypoint (`prepare_payroll_run`,
+    /// `batch_process_payroll`, `batch_process_payroll_idempotent`, and
+    /// `batch_process_payroll_bounded`) calls this before any other work, so an
+    /// unauthorized initiator is rejected immediately with an actionable error
+    /// instead of after unrelated validation has already run.
+    fn require_execution_initiator(e: &Env) {
+        let initiator = execution_authorization::authorized_initiator(e).expect(
+            "Not initialized: contract addresses must be configured before a payroll execution",
+        );
+        execution_authorization::require_authorized(e, &initiator);
+    }
+
+    /// Return the address currently authorized to initiate a contract execution
+    /// (issue #620).
+    ///
+    /// This is the payroll admin recorded by `initialize` and updated by the
+    /// admin rotation/handover flows. Returns `None` when the contract has not
+    /// been initialized, so callers can distinguish "not configured" from
+    /// "configured, but this address is not the initiator".
+    ///
+    /// Privacy-safe: exposes only the operational role address, never salary
+    /// amounts, employee identities, or proof material.
+    pub fn get_execution_initiator(e: Env) -> Option<Address> {
+        execution_authorization::authorized_initiator(&e)
+    }
+
+    /// Preflight whether `initiator` may initiate a contract execution
+    /// (issue #620).
+    ///
+    /// Read-only and safe to call before submitting an execution, so SDKs and
+    /// dashboards can tell a caller whether they hold the required role without
+    /// spending a transaction. Returns the full authorization snapshot:
+    /// verdict, resolved role, and whether the contract is initialized.
+    pub fn check_execution_initiator(
+        e: Env,
+        initiator: Address,
+    ) -> ExecutionInitiatorAuthorization {
+        execution_authorization::check(&e, &initiator)
+    }
+
+    /// Boolean convenience wrapper around `check_execution_initiator`
+    /// (issue #620).
+    pub fn is_execution_initiator_authorized(e: Env, initiator: Address) -> bool {
+        execution_authorization::check(&e, &initiator).authorized
+    }
+
+    /// Validate that `initiator` is authorized to initiate a contract execution
+    /// (issue #620).
+    ///
+    /// Unlike `check_execution_initiator`, this requires `initiator`'s
+    /// cryptographic authorization, so integrators can assert the role on-chain
+    /// as a precondition of a larger flow. It panics with an actionable error
+    /// when the contract is not initialized or the address is not the
+    /// registered payroll admin.
+    pub fn validate_execution_initiator(e: Env, initiator: Address) {
+        execution_authorization::require_authorized(&e, &initiator);
     }
 
     fn validate_run_id(run_id: u64) {
@@ -2983,6 +3048,8 @@ impl Payroll {
         nonce: BytesN<32>,
         draft_hash: Option<BytesN<32>>,
     ) -> u64 {
+        // Issue #620: authorize the execution initiator before any other work.
+        Self::require_execution_initiator(&e);
         Self::require_company_active(&e);
         // #360 - validate storage version for sensitive operation
         Self::validate_storage_version_for_operation(&e, "prepare_payroll_run");
@@ -3046,7 +3113,8 @@ impl Payroll {
         // #362 ? validate nonce monotonicity for this employer
         Self::validate_nonce_monotonicity(&e, &addrs.admin, &nonce);
 
-        addrs.admin.require_auth();
+        // Issue #620: `addrs.admin` was already authorized as the execution
+        // initiator at the top of this function.
 
         // Validate treasury asset allowlist
         if !Self::is_asset_allowed(e.clone(), addrs.token.clone()) {
@@ -3369,6 +3437,8 @@ impl Payroll {
         nonce: BytesN<32>,
         draft_hash: Option<BytesN<32>>,
     ) -> u64 {
+        // Issue #620: authorize the execution initiator before any other work.
+        Self::require_execution_initiator(&e);
         Self::require_company_active(&e);
         Self::validate_non_zero_digest(&e, &idempotency_key, "idempotency_key");
 
@@ -3391,12 +3461,8 @@ impl Payroll {
             if record.payload_hash != payload_hash {
                 panic!("Idempotency key payload mismatch");
             }
-            let addrs: ContractAddresses = e
-                .storage()
-                .persistent()
-                .get(&DataKey::Addresses)
-                .expect("Not initialized");
-            addrs.admin.require_auth();
+            // Issue #620: the execution initiator was authorized at the top of
+            // this function before the cached record is returned.
             return record.run_id;
         }
 
@@ -3440,6 +3506,8 @@ impl Payroll {
         nonce: BytesN<32>,
         draft_hash: Option<BytesN<32>>,
     ) -> u64 {
+        // Issue #620: authorize the execution initiator before any other work.
+        Self::require_execution_initiator(&e);
         Self::require_company_active(&e);
 
         // #360 - validate storage version for sensitive operation
@@ -3527,7 +3595,8 @@ impl Payroll {
             }
         }
 
-        addrs.admin.require_auth();
+        // Issue #620: `addrs.admin` was already authorized as the execution
+        // initiator at the top of this function.
 
         // Issue #338: enforce per-period capacity limits before the batch executes.
         Self::enforce_and_record_capacity(&e, count, expected_total_spend);
@@ -3881,6 +3950,8 @@ impl Payroll {
         draft_hash: Option<BytesN<32>>,
         batch_size: u32,
     ) -> u64 {
+        // Issue #620: authorize the execution initiator before any other work.
+        Self::require_execution_initiator(&e);
         Self::require_company_active(&e);
 
         Self::validate_storage_version_for_operation(&e, "batch_process_payroll_bounded");
@@ -3929,7 +4000,8 @@ impl Payroll {
             .get(&DataKey::Addresses)
             .expect("Not initialized");
 
-        addrs.admin.require_auth();
+        // Issue #620: `addrs.admin` was already authorized as the execution
+        // initiator at the top of this function.
 
         let batch_root = draft_hash.clone().unwrap_or_else(|| nonce.clone());
         let checkpoint_key = DataKey::BatchCheckpoint(
